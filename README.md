@@ -92,8 +92,7 @@ ds.download_chunk_features(
     features=ds.features.CALIBRATION.ALL
 )
 
-reader = ds.get_clip_feature(clip_id, "sensor_extrinsics")
-print(reader) # pandas dataframe
+reader = ds.get_clip_feature(clip_id, "sensor_extrinsics") # pandas dataframe
 
 # Instead of .ALL you can choose specific data:
 
