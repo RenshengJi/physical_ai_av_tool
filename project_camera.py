@@ -1,3 +1,15 @@
+#!/usr/bin/env python3
+"""
+Camera-centric LiDAR projection.
+
+Unlike project.py (LiDAR-centric), this script:
+- Iterates over camera frames as the reference
+- For each camera frame, collects LiDAR points within ±N ms time window
+- Points may come from multiple LiDAR spins
+- No motion compensation (±N ms is short enough)
+- Uses vectorized operations for speed
+"""
+
 from physical_ai_av.dataset import PhysicalAIAVDatasetInterface
 import numpy as np
 import matplotlib.pyplot as plt
@@ -9,31 +21,27 @@ from tqdm import tqdm
 # =============================================================================
 # Configuration
 # =============================================================================
-DURATION_US = 1_000_000  # Duration in microseconds (5s)
-TARGET_FPS = 10  # Output video frame rate
-USE_MOTION_COMPENSATION = True  # Set to False to disable motion compensation
+DURATION_US = 1_000_000  # Duration in microseconds (1s)
+TARGET_FPS = 30  # Output video frame rate (match camera fps)
 SCALE_FACTOR = 0.5  # Scale down each camera image to reduce final video size
+TIME_WINDOW_MS = 4  # ±N ms time window for selecting LiDAR points
 
 # All 7 cameras with their layout positions
-# Layout:
-#              [front_tele]
-# [rear_left] [cross_left] [front_wide] [cross_right] [rear_right]
-#              [rear_tele]
 CAMERAS = [
-    "camera_front_wide_120fov",   # Center
-    "camera_front_tele_30fov",    # Top
-    "camera_rear_tele_30fov",     # Bottom
-    "camera_cross_left_120fov",   # Left of center
-    "camera_cross_right_120fov",  # Right of center
-    "camera_rear_left_70fov",     # Far left
-    "camera_rear_right_70fov",    # Far right
+    "camera_front_wide_120fov",
+    "camera_front_tele_30fov",
+    "camera_rear_tele_30fov",
+    "camera_cross_left_120fov",
+    "camera_cross_right_120fov",
+    "camera_rear_left_70fov",
+    "camera_rear_right_70fov",
 ]
 
 # =============================================================================
 # Initialize dataset interface
 # =============================================================================
 ds = PhysicalAIAVDatasetInterface(token=True)
-clip_id = ds.clip_index.index[1]
+clip_id = ds.clip_index.index[2]
 chunk_id = ds.get_clip_chunk(clip_id)
 
 # Download required data
@@ -41,13 +49,13 @@ print("Downloading data...")
 ds.download_chunk_features(int(chunk_id), features=ds.features.CAMERA.ALL)
 ds.download_chunk_features(int(chunk_id), features=ds.features.LIDAR.LIDAR_TOP_360FOV)
 ds.download_chunk_features(int(chunk_id), features=ds.features.CALIBRATION.ALL)
-ds.download_chunk_features(int(chunk_id), features=ds.features.LABELS.EGOMOTION)
 
 # =============================================================================
 # Load calibration data
 # =============================================================================
 camera_intrinsics = ds.get_clip_feature(clip_id, "camera_intrinsics")
 sensor_extrinsics = ds.get_clip_feature(clip_id, "sensor_extrinsics")
+
 
 # =============================================================================
 # Helper functions
@@ -61,6 +69,7 @@ def get_transform_matrix(ext):
     T[:3, :3] = R
     T[:3, 3] = trans
     return T
+
 
 def decode_lidar_timestamps(mesh, reference_timestamp):
     """Decode per-point timestamps from DracoPy mesh colors."""
@@ -77,44 +86,19 @@ def decode_lidar_timestamps(mesh, reference_timestamp):
     absolute_ts = reference_timestamp + relative_ts - 105000.0
     return absolute_ts
 
-def get_egomotion_transform(egomotion_state):
-    """Get 4x4 transformation matrix from egomotion state."""
-    pose = egomotion_state.pose
-    T = pose.as_matrix()
-    return T
 
-def motion_compensate_points(points, point_timestamps, target_timestamp,
-                              egomotion_interp, T_rig_from_lidar):
-    """Apply motion compensation to LiDAR points (vectorized version)."""
-    N = points.shape[0]
-    target_ego = egomotion_interp(target_timestamp)
-    T_anchor_from_rig_target = get_egomotion_transform(target_ego)
-    T_rig_target_from_anchor = np.linalg.inv(T_anchor_from_rig_target)
+def project_lidar_to_camera_vectorized(points_lidar, T_cam_from_lidar, fw_poly, cx, cy, width, height):
+    """
+    Project LiDAR points to camera pixel coordinates using f-theta model.
+    Fully vectorized - no point-level loops.
 
-    points_homo = np.hstack([points, np.ones((N, 1))])
-    ts_quantized = (point_timestamps // 1000) * 1000
-    unique_ts, inverse_indices = np.unique(ts_quantized, return_inverse=True)
+    Returns:
+        pixels: (M, 2) array of valid pixel coordinates
+        depths: (M,) array of depths for valid points
+    """
+    if len(points_lidar) == 0:
+        return np.empty((0, 2)), np.empty(0)
 
-    T_lidar_from_rig = np.linalg.inv(T_rig_from_lidar)
-    num_unique = len(unique_ts)
-    transforms = np.zeros((num_unique, 4, 4))
-
-    for i, ts in enumerate(unique_ts):
-        try:
-            capture_ego = egomotion_interp(ts)
-            T_anchor_from_rig_capture = get_egomotion_transform(capture_ego)
-            T_full = T_lidar_from_rig @ T_rig_target_from_anchor @ T_anchor_from_rig_capture @ T_rig_from_lidar
-            transforms[i] = T_full
-        except Exception as e:
-            transforms[i] = np.eye(4)
-
-    point_transforms = transforms[inverse_indices]
-    compensated_homo = np.einsum('nij,nj->ni', point_transforms, points_homo)
-    compensated_points = compensated_homo[:, :3]
-    return compensated_points
-
-def project_lidar_to_camera(points_lidar, T_cam_from_lidar, fw_poly, cx, cy, width, height):
-    """Project LiDAR points to camera pixel coordinates using f-theta model."""
     N = points_lidar.shape[0]
     points_homo = np.hstack([points_lidar, np.ones((N, 1))])
     points_cam = (T_cam_from_lidar @ points_homo.T).T[:, :3]
@@ -125,9 +109,12 @@ def project_lidar_to_camera(points_lidar, T_cam_from_lidar, fw_poly, cx, cy, wid
     r_xy = np.sqrt(x_cam**2 + y_cam**2)
     theta = np.arctan2(r_xy, z_cam)
 
+    # Vectorized polynomial evaluation
     r_pixel = np.zeros_like(theta)
-    for i, coef in enumerate(fw_poly):
-        r_pixel += coef * (theta ** i)
+    theta_power = np.ones_like(theta)
+    for coef in fw_poly:
+        r_pixel += coef * theta_power
+        theta_power *= theta
 
     phi = np.arctan2(y_cam, x_cam)
     u = cx + r_pixel * np.cos(phi)
@@ -138,7 +125,8 @@ def project_lidar_to_camera(points_lidar, T_cam_from_lidar, fw_poly, cx, cy, wid
 
     pixels = np.stack([u[valid_mask], v[valid_mask]], axis=1)
     depths = z_cam[valid_mask]
-    return pixels, valid_mask, depths
+    return pixels, depths
+
 
 def depth_to_color_rgb(depths, d_min=0.1, d_max=80.0):
     """Convert depth values to RGB colors using turbo colormap."""
@@ -147,29 +135,37 @@ def depth_to_color_rgb(depths, d_min=0.1, d_max=80.0):
     colors = cmap_func(d_normalized)[:, :3]
     return (colors * 255).astype(np.uint8)
 
-def render_single_camera(camera_image, points, T_cam_from_lidar, fw_poly, cx, cy, width, height):
-    """Render LiDAR projection on a single camera image."""
-    pixels, valid_mask, depths = project_lidar_to_camera(
-        points, T_cam_from_lidar, fw_poly, cx, cy, width, height
-    )
 
+def render_points_on_image(image, pixels, depths, point_size=2):
+    """
+    Render projected points on image using vectorized operations.
+    Uses OpenCV's efficient drawing.
+    """
     if len(pixels) == 0:
-        return camera_image.copy()
+        return image.copy()
 
-    output = camera_image.copy()
+    output = image.copy()
     point_colors = depth_to_color_rgb(depths)
 
-    for (u, v), color in zip(pixels.astype(int), point_colors):
-        cv2.circle(output, (u, v), 2, color.tolist(), -1)
+    # Convert to integer coordinates
+    pixels_int = pixels.astype(np.int32)
+
+    # Draw all circles - OpenCV doesn't have a fully vectorized circle draw,
+    # but we can use polylines for speed or just iterate (still fast for ~100k points)
+    # For best performance with many points, we draw directly on the image array
+    for i in range(len(pixels_int)):
+        cv2.circle(output, (pixels_int[i, 0], pixels_int[i, 1]),
+                   point_size, point_colors[i].tolist(), -1)
 
     return output
+
 
 # =============================================================================
 # Prepare camera data structures
 # =============================================================================
 print("Loading camera parameters...")
 
-# LiDAR extrinsics (same for all cameras)
+# LiDAR extrinsics
 lidar_ext = sensor_extrinsics.loc["lidar_top_360fov"]
 T_rig_from_lidar = get_transform_matrix(lidar_ext)
 
@@ -199,7 +195,7 @@ for cam_name in CAMERAS:
         'T_cam_from_lidar': T_cam_from_lidar,
     }
 
-# Get single camera dimensions (assuming all cameras have same resolution)
+# Get single camera dimensions
 single_width = camera_data[CAMERAS[0]]['width']
 single_height = camera_data[CAMERAS[0]]['height']
 
@@ -210,83 +206,99 @@ scaled_height = int(single_height * SCALE_FACTOR)
 # =============================================================================
 # Layout calculation
 # =============================================================================
-# Layout (3 rows, 5 columns with some cells merged/empty):
-#
-# Row 0:    [empty] [empty] [front_tele] [empty] [empty]
-# Row 1:    [rear_left] [cross_left] [front_wide] [cross_right] [rear_right]
-# Row 2:    [empty] [empty] [rear_tele] [empty] [empty]
-#
-# For simplicity, we'll create a canvas that fits:
-# - Width: 5 cameras side by side
-# - Height: 3 cameras stacked
-
 canvas_width = scaled_width * 5
 canvas_height = scaled_height * 3
 
-# Camera positions (top-left corner of each camera in the canvas)
-# Format: (x_offset, y_offset)
 camera_positions = {
-    "camera_front_tele_30fov":    (scaled_width * 2, 0),                      # Top center
-    "camera_rear_left_70fov":     (0, scaled_height),                         # Middle far left
-    "camera_cross_left_120fov":   (scaled_width, scaled_height),              # Middle left
-    "camera_front_wide_120fov":   (scaled_width * 2, scaled_height),          # Middle center
-    "camera_cross_right_120fov":  (scaled_width * 3, scaled_height),          # Middle right
-    "camera_rear_right_70fov":    (scaled_width * 4, scaled_height),          # Middle far right
-    "camera_rear_tele_30fov":     (scaled_width * 2, scaled_height * 2),      # Bottom center
+    "camera_front_tele_30fov":    (scaled_width * 2, 0),
+    "camera_rear_left_70fov":     (0, scaled_height),
+    "camera_cross_left_120fov":   (scaled_width, scaled_height),
+    "camera_front_wide_120fov":   (scaled_width * 2, scaled_height),
+    "camera_cross_right_120fov":  (scaled_width * 3, scaled_height),
+    "camera_rear_right_70fov":    (scaled_width * 4, scaled_height),
+    "camera_rear_tele_30fov":     (scaled_width * 2, scaled_height * 2),
 }
 
 # =============================================================================
-# Load LiDAR and egomotion data
+# Load and preprocess all LiDAR data
 # =============================================================================
+print("Loading LiDAR data...")
 lidar_data = ds.get_clip_feature(clip_id, "lidar_top_360fov")
-egomotion_interp = ds.get_clip_feature(clip_id, "egomotion")
-
 lidar_df = list(lidar_data.values())[0]
 print(f"Total LiDAR scans: {len(lidar_df)}")
 
-# Use front_wide camera timestamps as reference
-camera_timestamps = camera_data["camera_front_wide_120fov"]['reader'].timestamps
-print(f"Total camera frames: {len(camera_timestamps)}")
+# Preload all LiDAR points and timestamps for the duration
+print("Preprocessing LiDAR point clouds...")
+all_points = []
+all_timestamps = []
 
-# Filter LiDAR scans within duration
-lidar_timestamps = lidar_df['reference_timestamp'].values
-lidar_indices = np.where(lidar_timestamps < DURATION_US)[0]
-print(f"Processing {len(lidar_indices)} LiDAR scans")
+for idx in tqdm(range(len(lidar_df)), desc="Decoding LiDAR"):
+    lidar_scan = lidar_df.iloc[idx]
+    reference_timestamp = lidar_scan['reference_timestamp']
+
+    # Skip scans outside our time range (with some margin for the time window)
+    if reference_timestamp > DURATION_US + TIME_WINDOW_MS * 1000:
+        continue
+    if reference_timestamp < -TIME_WINDOW_MS * 1000 - 105000:  # LiDAR spin can have points up to 105ms before reference
+        continue
+
+    draco_bytes = lidar_scan['draco_encoded_pointcloud']
+    mesh = DracoPy.decode(draco_bytes)
+    points = np.array(mesh.points)
+    timestamps = decode_lidar_timestamps(mesh, reference_timestamp)
+
+    all_points.append(points)
+    all_timestamps.append(timestamps)
+
+# Concatenate all points and timestamps
+all_points = np.vstack(all_points)
+all_timestamps = np.concatenate(all_timestamps)
+print(f"Total LiDAR points loaded: {len(all_points)}")
+
+# Sort by timestamp for efficient querying
+sort_indices = np.argsort(all_timestamps)
+all_points = all_points[sort_indices]
+all_timestamps = all_timestamps[sort_indices]
 
 # =============================================================================
-# Create video
+# Get camera frame timestamps (use front_wide as reference for frame timing)
 # =============================================================================
-output_path = "lidar_projection_7cameras.mp4"
+ref_camera = camera_data["camera_front_wide_120fov"]
+camera_timestamps = ref_camera['reader'].timestamps
+
+# Filter camera frames within duration
+camera_frame_indices = np.where(camera_timestamps < DURATION_US)[0]
+print(f"Processing {len(camera_frame_indices)} camera frames")
+
+# =============================================================================
+# Create video (camera-centric)
+# =============================================================================
+output_path = "lidar_projection_camera_centric.mp4"
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 video_writer = cv2.VideoWriter(output_path, fourcc, TARGET_FPS, (canvas_width, canvas_height))
 
 print(f"Output video size: {canvas_width} x {canvas_height}")
-print("Rendering frames with LiDAR projection on all 7 cameras...")
+print(f"Time window: ±{TIME_WINDOW_MS} ms")
+print("Rendering frames (camera-centric)...")
 
-for lidar_idx in tqdm(lidar_indices):
-    lidar_scan = lidar_df.iloc[lidar_idx]
-    lidar_ts = lidar_scan['reference_timestamp']
+time_window_us = TIME_WINDOW_MS * 1000  # Convert to microseconds
 
-    # Decode LiDAR point cloud once
-    draco_bytes = lidar_scan['draco_encoded_pointcloud']
-    reference_timestamp = lidar_scan['reference_timestamp']
-    mesh = DracoPy.decode(draco_bytes)
-    points = np.array(mesh.points)
+for frame_idx in tqdm(camera_frame_indices, desc="Rendering"):
+    # Get the timestamp for this frame (from front_wide camera)
+    frame_ts = camera_timestamps[frame_idx]
 
-    # Apply motion compensation if enabled (use front_wide camera timestamp as target)
-    camera_frame_idx = np.argmin(np.abs(camera_timestamps - lidar_ts))
-    target_ts = camera_timestamps[camera_frame_idx]
+    # Find LiDAR points within ±N ms of this camera frame (vectorized)
+    t_min = frame_ts - time_window_us
+    t_max = frame_ts + time_window_us
 
-    if USE_MOTION_COMPENSATION:
-        point_timestamps = decode_lidar_timestamps(mesh, reference_timestamp)
-        points_compensated = motion_compensate_points(
-            points, point_timestamps, target_ts,
-            egomotion_interp, T_rig_from_lidar
-        )
-    else:
-        points_compensated = points
+    # Use searchsorted for O(log n) lookup
+    idx_start = np.searchsorted(all_timestamps, t_min, side='left')
+    idx_end = np.searchsorted(all_timestamps, t_max, side='right')
 
-    # Create canvas (black background)
+    # Get points in time window
+    points_in_window = all_points[idx_start:idx_end]
+
+    # Create canvas
     canvas = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
 
     # Render each camera
@@ -294,23 +306,27 @@ for lidar_idx in tqdm(lidar_indices):
         cam = camera_data[cam_name]
 
         # Find nearest frame for this camera
-        cam_timestamps = cam['reader'].timestamps
-        cam_frame_idx = np.argmin(np.abs(cam_timestamps - lidar_ts))
+        cam_timestamps_arr = cam['reader'].timestamps
+        cam_frame_idx = np.argmin(np.abs(cam_timestamps_arr - frame_ts))
 
         # Decode camera image
         cam_image = cam['reader'].decode_images_from_frame_indices(
             np.array([cam_frame_idx])
         )[0]
 
-        # Render LiDAR projection
-        rendered = render_single_camera(
-            cam_image, points_compensated,
+        # Project LiDAR points (vectorized)
+        pixels, depths = project_lidar_to_camera_vectorized(
+            points_in_window,
             cam['T_cam_from_lidar'], cam['fw_poly'],
             cam['cx'], cam['cy'], cam['width'], cam['height']
         )
 
-        # Scale down the rendered image
-        rendered_scaled = cv2.resize(rendered, (scaled_width, scaled_height), interpolation=cv2.INTER_AREA)
+        # Render points on image
+        rendered = render_points_on_image(cam_image, pixels, depths)
+
+        # Scale down
+        rendered_scaled = cv2.resize(rendered, (scaled_width, scaled_height),
+                                      interpolation=cv2.INTER_AREA)
 
         # Place in canvas
         x_off, y_off = camera_positions[cam_name]
@@ -322,3 +338,4 @@ for lidar_idx in tqdm(lidar_indices):
 
 video_writer.release()
 print(f"Saved video to: {output_path}")
+print(f"Points per frame (avg): ~{len(all_points) / len(camera_frame_indices):.0f}")
